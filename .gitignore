@@ -1,0 +1,11 @@
+# Folder view configuration files
+.DS_Store
+Desktop.ini
+
+# Thumbnail cache files
+._*
+Thumbs.db
+
+# Personal blocklist — kept local, never published. Use blocklist.example as a
+# starting point (the script auto-copies it on first run).
+/blocklist

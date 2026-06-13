@@ -1,0 +1,10 @@
+# Example blocklist — one bare domain per line. '#' and blank lines are ignored.
+# Copy this to "blocklist" (the script does it for you on first run), then edit
+# with `focus add <url>` / `focus rm <url>`. Your real blocklist stays local and
+# is gitignored, so it is never published.
+youtube.com
+twitter.com
+reddit.com
+news.ycombinator.com
+facebook.com
+instagram.com

@@ -1,0 +1,47 @@
+#compdef focus
+#
+# zsh completion for `focus`. Install via `focus install` (which symlinks this
+# into a site-functions dir on your fpath), then `exec zsh`.
+
+_focus() {
+  local curcontext="$curcontext" state line
+  local -a subs
+  subs=(
+    'on:start focusing (inject blocklist)'
+    'off:stop focusing (remove blocklist)'
+    'add:add domain(s) to the blocklist'
+    'rm:remove domain(s) from the blocklist'
+    'list:print the blocklist'
+    'status:show enabled/disabled and domain count'
+    'install:symlink onto PATH and install completion'
+    'remove:uninstall focus (symlinks + clear hosts block)'
+    'help:print usage'
+  )
+
+  _arguments -C \
+    '1: :->cmd' \
+    '*:: :->args'
+
+  case "$state" in
+    cmd)
+      _describe -t commands 'focus command' subs
+      ;;
+    args)
+      case "${line[1]}" in
+        rm)
+          # complete domains from the blocklist next to the real focus script
+          local self bl
+          self="${commands[focus]:A}"
+          bl="${self:h:h}/blocklist"
+          if [[ -f "$bl" ]]; then
+            local -a domains
+            domains=( ${(f)"$(grep -vE '^[[:space:]]*(#|$)' "$bl")"} )
+            _describe -t domains 'blocked domain' domains
+          fi
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_focus "$@"

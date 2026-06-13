@@ -1,0 +1,345 @@
+#!/bin/zsh
+#
+# focus — block distracting sites at the DNS level by managing a delimited
+# block inside /etc/hosts. The script finds its own blocklist relative to
+# itself; the one privileged step (writing /etc/hosts) is delegated to the
+# tiny focus-hosts helper, which `focus install` makes password-free.
+
+emulate -L zsh
+set -o pipefail
+
+# --- self-location (works through the /usr/local/bin/focus symlink) ----------
+SELF="${0:A}"             # absolute, symlink-resolved path of this script
+SCRIPT_DIR="${SELF:h}"    # .../bin
+REPO_DIR="${SCRIPT_DIR:h}"
+BLOCKLIST="$REPO_DIR/blocklist"
+
+HOSTS="/etc/hosts"
+MARK_START='# >>> focus blocklist >>>'
+MARK_END='# <<< focus blocklist <<<'
+
+# The only privileged operation (writing /etc/hosts) is delegated to a tiny
+# helper. REPO_HELPER is the auditable source; install renders a root-owned copy
+# at NOPASSWD_HELPER and scopes SUDOERS_RULE so on/off need no password.
+# The copy goes in /Library/PrivilegedHelperTools (root-owned on macOS, parent
+# /Library is sticky) — NOT /usr/local, which Homebrew often makes user-writable;
+# a user-writable helper dir would let anyone swap the file and gain root.
+REPO_HELPER="$SCRIPT_DIR/focus-hosts"
+HELPER_DIR="/Library/PrivilegedHelperTools"
+NOPASSWD_HELPER="$HELPER_DIR/focus-hosts"
+SUDOERS_RULE="/etc/sudoers.d/focus"
+
+# Chromium-family browsers we can clear service workers for. Each entry is
+# "app name|user-data dir"; the app name is also the process name (pgrep -x)
+# and the AppleScript app name (osascript quit).
+typeset -ga BROWSERS=(
+  "Google Chrome|$HOME/Library/Application Support/Google/Chrome"
+  "Brave Browser|$HOME/Library/Application Support/BraveSoftware/Brave-Browser"
+  "Microsoft Edge|$HOME/Library/Application Support/Microsoft Edge"
+  "Arc|$HOME/Library/Application Support/Arc/User Data"
+  "Vivaldi|$HOME/Library/Application Support/Vivaldi"
+  "Chromium|$HOME/Library/Application Support/Chromium"
+)
+
+# --- helpers -----------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+focus — toggle a /etc/hosts blocklist to kill distractions.
+
+Usage: focus <command> [args]
+
+  on [-f]          inject the blocklist into /etc/hosts, start focusing, and
+                   clear cached service workers (PWAs like YouTube) for any
+                   closed browser. -f also quits running browsers to clear them.
+  off              remove the blocklist from /etc/hosts, stop focusing
+  add <url...>     add domain(s) to the blocklist (re-applies if enabled)
+  rm  <url...>     remove domain(s) from the blocklist (re-applies if enabled)
+  list             print the blocklist (one domain per line)
+  status           show whether focus is enabled, plus the domain count
+  install          PATH symlink, tab-completion, and a scoped NOPASSWD rule so
+                   on/off stop prompting for a password
+  remove           uninstall focus: undo install and clear any active block
+  help             print this message
+
+URLs passed to add/rm may be full ("https://www.site.com/x") — they are
+normalized to a bare domain. Each domain blocks both <domain> and www.<domain>
+on 127.0.0.1 and ::1. Writing /etc/hosts needs root: on/off prompt for your
+password until you run 'focus install', which sets up passwordless on/off.
+EOF
+}
+
+# Guard for the NOPASSWD helper's directory: it must be root-owned and not
+# writable by group/other, or a non-root user could swap the helper and run
+# arbitrary code as root. Creates it safely if absent; refuses if unsafe.
+ensure_secure_dir() {
+  local dir="$1"
+  if [[ ! -d "$dir" ]]; then
+    sudo install -d -m 0755 -o root -g wheel "$dir" || return 1
+    return 0
+  fi
+  local owner perms
+  owner="$(stat -Lf '%u' "$dir")"   # -L: follow symlinks, check the real target
+  perms="$(stat -Lf '%p' "$dir")"
+  if [[ "$owner" != "0" ]]; then
+    echo "refusing: $dir is not root-owned (uid $owner). Fix: sudo chown root:wheel '$dir'" >&2
+    return 1
+  fi
+  if (( (8#${perms[-3,-1]}) & 8#22 )); then
+    echo "refusing: $dir is group/other-writable (mode ${perms[-3,-1]}). Fix: sudo chmod go-w '$dir'" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Apply the privileged hosts change ($1 = on|off). Uses the root-owned,
+# password-free helper if install set it up; otherwise runs the repo helper with
+# a normal (password) sudo, passing the blocklist path explicitly.
+apply_block() {
+  if [[ -x "$NOPASSWD_HELPER" ]]; then
+    sudo "$NOPASSWD_HELPER" "$1"
+  else
+    sudo /usr/bin/env "FOCUS_BLOCKLIST=$BLOCKLIST" "$REPO_HELPER" "$1"
+  fi
+}
+
+# Blocklist with comments and blank lines stripped.
+clean_list() {
+  [[ -f "$BLOCKLIST" ]] || return 0
+  grep -vE '^[[:space:]]*(#|$)' "$BLOCKLIST"
+}
+
+count_domains() { clean_list | grep -c . }
+
+is_enabled() { grep -qF "$MARK_START" "$HOSTS" 2>/dev/null }
+
+# First-run convenience: if there's no personal blocklist yet, seed one from the
+# shipped example so a fresh clone works immediately. The real blocklist is
+# gitignored, so it stays local.
+ensure_blocklist() {
+  [[ -f "$BLOCKLIST" ]] && return 0
+  [[ -f "$REPO_DIR/blocklist.example" ]] || return 0
+  cp "$REPO_DIR/blocklist.example" "$BLOCKLIST"
+  echo "created $BLOCKLIST from blocklist.example — edit with 'focus add'/'focus rm'." >&2
+}
+
+# Normalize a possibly-full URL into a bare apex-ish domain.
+normalize() {
+  local u="$1"
+  u="${u#*://}"      # strip scheme://
+  u="${u##*@}"       # strip user:pass@
+  u="${u%%/*}"       # strip /path
+  u="${u%%\?*}"      # strip ?query (if no path was present)
+  u="${u%%:*}"       # strip :port
+  u="${(L)u}"        # lowercase
+  u="${u#www.}"      # drop a single leading www.
+  print -- "$u"
+}
+
+# Blow away cached service workers so PWAs (e.g. YouTube) can't serve
+# themselves from local cache and bypass the DNS block. Filesystem clearing is
+# all-or-nothing per browser profile and requires the browser to be quit, so we
+# clear closed browsers automatically and only touch running ones with force=1
+# (which quits them first). MUST run as the invoking user, never root.
+clear_service_workers() {
+  local force="$1"
+  local -a running cleared
+  local entry name base
+  for entry in $BROWSERS; do
+    name="${entry%%|*}"
+    base="${entry#*|}"
+    [[ -d "$base" ]] || continue                      # not installed
+    if pgrep -x "$name" >/dev/null 2>&1; then
+      if [[ "$force" == "force" ]]; then
+        echo "quitting $name…"
+        osascript -e "quit app \"$name\"" 2>/dev/null
+        local i=0
+        while pgrep -x "$name" >/dev/null 2>&1 && (( i < 20 )); do sleep 0.5; (( i++ )); done
+      else
+        running+=("$name")
+        continue
+      fi
+    fi
+    # "Service Worker" dirs live one level under each profile (Default, Profile N…).
+    if find "$base" -maxdepth 2 -type d -name "Service Worker" 2>/dev/null | grep -q .; then
+      find "$base" -maxdepth 2 -type d -name "Service Worker" -exec rm -rf {} + 2>/dev/null
+      cleared+=("$name")
+    fi
+  done
+  (( ${#cleared} )) && echo "cleared service workers: ${(j:, :)cleared}"
+  (( ${#running} )) && echo "still running, not cleared: ${(j:, :)running} — quit them, or use 'focus on -f', to drop cached PWAs like YouTube."
+  return 0
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_on() {
+  clear_service_workers "$1"
+  apply_block on || return 1
+  echo "focus enabled — $(count_domains) domains blocked."
+}
+
+cmd_off() {
+  if ! is_enabled; then
+    echo "focus is already disabled."
+    return 0
+  fi
+  apply_block off || return 1
+  echo "focus disabled."
+}
+
+# Re-apply the block if focus is currently on (after editing the blocklist).
+reapply_if_enabled() {
+  if is_enabled; then
+    apply_block on && echo "re-applied to /etc/hosts."
+  fi
+}
+
+cmd_add() {
+  local changed=0 raw d
+  for raw in "$@"; do
+    d="$(normalize "$raw")"
+    [[ -z "$d" ]] && { echo "skipped (empty): $raw"; continue }
+    if grep -qxF "$d" <(clean_list); then
+      echo "already blocked: $d"
+    else
+      print -- "$d" >> "$BLOCKLIST"
+      echo "added: $d"
+      changed=1
+    fi
+  done
+  (( changed )) && reapply_if_enabled
+}
+
+cmd_rm() {
+  local changed=0 raw d tmp
+  for raw in "$@"; do
+    d="$(normalize "$raw")"
+    if grep -qxF "$d" <(clean_list); then
+      tmp="$(mktemp)"
+      grep -vxF "$d" "$BLOCKLIST" > "$tmp"
+      cp "$tmp" "$BLOCKLIST"
+      rm -f "$tmp"
+      echo "removed: $d"
+      changed=1
+    else
+      echo "not in blocklist: $d"
+    fi
+  done
+  (( changed )) && reapply_if_enabled
+}
+
+cmd_list() { clean_list }
+
+cmd_status() {
+  if is_enabled; then
+    echo "enabled ($(count_domains) domains)"
+  else
+    echo "disabled ($(count_domains) domains)"
+  fi
+}
+
+cmd_install() {
+  local link="/usr/local/bin/focus"
+  local compdir="/usr/local/share/zsh/site-functions"
+  echo "linking $link -> $SELF (sudo)"
+  sudo ln -sf "$SELF" "$link"
+  sudo mkdir -p "$compdir"
+  sudo ln -sf "$REPO_DIR/completions/_focus" "$compdir/_focus"
+  echo "installed completion -> $compdir/_focus"
+
+  # Render a root-owned copy of the helper with this blocklist path baked in
+  # LITERALLY (no FOCUS_BLOCKLIST env fallback in the privileged copy), then add
+  # a scoped NOPASSWD rule. Root ownership + a root-only dir are the security
+  # boundary: the user can't modify, or swap, what runs as root.
+  ensure_secure_dir "$HELPER_DIR" || { echo "helper not installed; on/off will prompt for a password." >&2; return 1 }
+  local rendered line; rendered="$(mktemp)"
+  while IFS= read -r line; do
+    [[ "$line" == BLOCKLIST=* ]] && line="BLOCKLIST=\"$BLOCKLIST\""
+    print -r -- "$line"
+  done < "$REPO_HELPER" > "$rendered"
+  sudo install -m 0755 -o root -g wheel "$rendered" "$NOPASSWD_HELPER"
+  rm -f "$rendered"
+  echo "installed helper -> $NOPASSWD_HELPER"
+
+  local rule; rule="$(mktemp)"
+  printf '%s ALL=(root) NOPASSWD: %s on, %s off\n' \
+    "$(id -un)" "$NOPASSWD_HELPER" "$NOPASSWD_HELPER" > "$rule"
+  if sudo visudo -cf "$rule" >/dev/null 2>&1; then
+    sudo install -m 0440 -o root -g wheel "$rule" "$SUDOERS_RULE"
+    echo "installed NOPASSWD rule -> $SUDOERS_RULE (on/off no longer prompt)"
+  else
+    echo "sudoers rule failed validation — skipped; on/off will prompt for a password." >&2
+  fi
+  rm -f "$rule"
+
+  echo "run 'exec zsh' (or open a new shell) to enable tab-completion."
+}
+
+cmd_remove() {
+  local link="/usr/local/bin/focus"
+  local comp="/usr/local/share/zsh/site-functions/_focus"
+
+  # Clear any active block first, so it isn't orphaned once focus is gone.
+  if is_enabled; then
+    echo "clearing active /etc/hosts block…"
+    apply_block off >/dev/null
+  fi
+
+  # Drop the NOPASSWD rule and the root-owned helper it points at.
+  if [[ -f "$SUDOERS_RULE" ]]; then
+    echo "removing $SUDOERS_RULE (sudo)"
+    sudo rm -f "$SUDOERS_RULE"
+  fi
+  if [[ -e "$NOPASSWD_HELPER" ]]; then
+    echo "removing $NOPASSWD_HELPER (sudo)"
+    sudo rm -f "$NOPASSWD_HELPER"
+  fi
+
+  # Only remove symlinks that actually point at this repo — never clobber an
+  # unrelated file someone happens to have at those paths.
+  if [[ -L "$link" && "${link:A}" == "${SELF:A}" ]]; then
+    echo "removing $link (sudo)"
+    sudo rm -f "$link"
+  elif [[ -e "$link" ]]; then
+    echo "skipping $link — not a symlink to this script"
+  else
+    echo "nothing at $link"
+  fi
+
+  if [[ -L "$comp" && "${comp:A}" == "${REPO_DIR:A}/completions/_focus" ]]; then
+    echo "removing $comp (sudo)"
+    sudo rm -f "$comp"
+  elif [[ -e "$comp" ]]; then
+    echo "skipping $comp — not ours"
+  else
+    echo "nothing at $comp"
+  fi
+
+  echo "uninstalled. the repo and your blocklist are untouched — delete the folder to fully remove."
+}
+
+# --- dispatch ----------------------------------------------------------------
+
+cmd="${1-}"
+(( $# > 0 )) && shift
+
+# Seed a personal blocklist on first use of any command that reads it.
+case "$cmd" in
+  on|-on|off|-off|add|rm|list|ls|status) ensure_blocklist ;;
+esac
+
+case "$cmd" in
+  on|-on)        [[ "$1" == "-f" || "$1" == "--force" ]] && cmd_on force || cmd_on ;;
+  off|-off)      cmd_off ;;
+  add)           (( $# >= 1 )) || { echo "usage: focus add <url...>" >&2; exit 1 }; cmd_add "$@" ;;
+  rm)            (( $# >= 1 )) || { echo "usage: focus rm <url...>" >&2; exit 1 }; cmd_rm "$@" ;;
+  list|ls)       cmd_list ;;
+  status)        cmd_status ;;
+  install)       cmd_install ;;
+  remove)        cmd_remove ;;
+  help)          usage ;;
+  -h|--help)     echo "Run 'focus help'." ;;
+  '')            usage; exit 1 ;;
+  *)             echo "unknown command: $cmd" >&2; usage >&2; exit 1 ;;
+esac

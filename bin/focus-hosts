@@ -1,0 +1,59 @@
+#!/bin/zsh
+#
+# focus-hosts — the ONLY part of focus that runs as root.
+#
+# `focus install` renders this template (substituting the blocklist path for
+# __BLOCKLIST__) into a ROOT-OWNED copy at /Library/PrivilegedHelperTools/
+# focus-hosts and adds a scoped rule to /etc/sudoers.d/focus so `focus on`/`off`
+# can run it without a password. It is deliberately tiny and auditable:
+#
+#   * It takes exactly one fixed argument: "on" or "off". Nothing else.
+#   * It never accepts a file path or arbitrary input.
+#   * The IP column is hardcoded to 127.0.0.1 / ::1, so the worst a tampered
+#     blocklist can do is point a domain at localhost — never at some other host.
+#
+# Before install (no root-owned copy yet) focus runs this same file with a
+# normal password sudo, passing the blocklist via FOCUS_BLOCKLIST.
+
+emulate -L zsh
+set -o pipefail
+
+BLOCKLIST="${FOCUS_BLOCKLIST:-__BLOCKLIST__}"
+HOSTS="/etc/hosts"
+MARK_START='# >>> focus blocklist >>>'
+MARK_END='# <<< focus blocklist <<<'
+
+case "$1" in
+  on|off) ;;
+  *) echo "focus-hosts: expected 'on' or 'off'" >&2; exit 2 ;;
+esac
+
+clean_list() {
+  [[ -f "$BLOCKLIST" ]] || return 0
+  grep -vE '^[[:space:]]*(#|$)' "$BLOCKLIST"
+}
+
+gen_block() {
+  print -- "$MARK_START"
+  clean_list | while IFS= read -r d; do
+    printf '127.0.0.1\t%s\n::1\t\t%s\n127.0.0.1\twww.%s\n::1\t\twww.%s\n' \
+      "$d" "$d" "$d" "$d"
+  done
+  print -- "$MARK_END"
+}
+
+# Rewrite /etc/hosts = existing content minus any old block, plus a fresh block
+# when turning on. The temp file is created in the same directory as /etc/hosts
+# so the final `mv` is an atomic rename — a crash can never leave a truncated
+# /etc/hosts. We set 0644 first so the replacement lands with the usual perms.
+tmp="$(mktemp "${HOSTS}.focus.XXXXXX")" || exit 1
+trap 'rm -f "$tmp"' EXIT
+sed "/$MARK_START/,/$MARK_END/d" "$HOSTS" > "$tmp"
+[[ "$1" == "on" ]] && gen_block >> "$tmp"
+chmod 0644 "$tmp"
+mv -f "$tmp" "$HOSTS"
+
+# Flush DNS so the change takes effect immediately.
+dscacheutil -flushcache 2>/dev/null
+killall -HUP mDNSResponder 2>/dev/null
+exit 0
