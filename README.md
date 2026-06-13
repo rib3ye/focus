@@ -126,3 +126,7 @@ entirely as you, no root involved.
 ## Requirements
 
 macOS, zsh, and an account with `sudo`. No other dependencies.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
