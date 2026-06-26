@@ -44,7 +44,7 @@ focus add <url...>   add domain(s) to the blocklist (full URLs are normalized)
 focus rm  <url...>   remove domain(s) from the blocklist
 focus list           print the blocklist
 focus status         show enabled/disabled + domain count
-focus install        passwordless on/off; from a checkout also PATH symlink + completion
+focus install        passwordless on/off; from a checkout also ~/.local symlink + completion
 focus remove         undo install and clear any active block
 focus help           print usage
 ```
@@ -85,23 +85,32 @@ git clone https://github.com/rib3ye/focus
 cd focus
 ./bin/focus add reddit.com youtube.com   # build your list
 ./bin/focus on                           # start focusing
-./bin/focus install                      # optional: ~/.local symlink, completion, passwordless on/off
-exec zsh                                  # reload to pick up tab-completion
 ```
 
 From a checkout your blocklist stays in-tree at `./blocklist` — **gitignored and
 never published**; `blocklist.example` is the shipped starting point, copied to
 `blocklist` on first run. Edit it with `focus add` / `focus rm`, or by hand.
 
-`install` is per-user and needs no `sudo` for the PATH/completion part: it
-symlinks `focus` into `~/.local/bin` and the completion into
-`~/.local/share/zsh/site-functions`, printing a one-line `PATH`/`fpath` hint for
-your `~/.zshrc` if either isn't picked up yet. (The passwordless `on`/`off`
-setup still uses `sudo` — that genuinely needs root.) The symlink points back at
-this repo, so don't move or delete the folder after `install`. Undo with
-`focus remove` — it removes only symlinks that point at this repo (including any
-from older `/usr/local` installs) and leaves the repo and your blocklist in
-place.
+#### Optional: install onto your PATH (`~/.local`)
+
+So you can run `focus` from anywhere instead of typing `./bin/focus`:
+
+```
+./bin/focus install     # per-user install — no sudo for the PATH/completion part
+exec zsh                # reload to pick up tab-completion
+```
+
+`install` symlinks `focus` into `~/.local/bin` and the zsh completion into
+`~/.local/share/zsh/site-functions` (honoring `XDG_DATA_HOME`) — **no `sudo`
+needed**. If `~/.local/bin` isn't on your `PATH`, or that completion dir isn't on
+your `fpath`, it prints the exact one-line snippet to add to `~/.zshrc`. The same
+command also makes `on`/`off` password-free; *that* step does use `sudo`, because
+writing `/etc/hosts` needs root (see [Privileges](#privileges)).
+
+The symlink points back at this repo, so don't move or delete the folder after
+installing. Undo with `focus remove` — it removes only symlinks that resolve to
+this repo (including any left by older `/usr/local` installs) and leaves the repo
+and your blocklist in place.
 
 ## Service workers (the YouTube problem)
 
