@@ -8,11 +8,34 @@
 emulate -L zsh
 set -o pipefail
 
-# --- self-location (works through the /usr/local/bin/focus symlink) ----------
+# --- self-location (works through a /usr/local/bin or Homebrew symlink) ------
 SELF="${0:A}"             # absolute, symlink-resolved path of this script
-SCRIPT_DIR="${SELF:h}"    # .../bin
+SCRIPT_DIR="${SELF:h}"    # .../bin (clone) or .../libexec (installed)
 REPO_DIR="${SCRIPT_DIR:h}"
-BLOCKLIST="$REPO_DIR/blocklist"
+
+# A "managed" install (Homebrew & friends) lives under a read-only prefix that
+# is wiped and recreated on every upgrade. Detect it once: a Homebrew keg is
+# always under .../Cellar/..., and any other read-only prefix is caught by the
+# writability test. This decides where the blocklist lives and lets
+# install/remove defer PATH + completion to the package manager.
+if [[ "$SELF" == */Cellar/* || ! -w "$REPO_DIR" ]]; then
+  MANAGED=1
+else
+  MANAGED=0
+fi
+
+# The personal blocklist. A managed copy can't keep it next to the script (the
+# Cellar is read-only and replaced on upgrade), so it lives in a stable,
+# user-owned config dir. A working-tree checkout keeps its in-tree ./blocklist,
+# so clone-and-hack behaves exactly as before. FOCUS_BLOCKLIST overrides both.
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/focus"
+if [[ -n "$FOCUS_BLOCKLIST" ]]; then
+  BLOCKLIST="$FOCUS_BLOCKLIST"
+elif (( MANAGED )); then
+  BLOCKLIST="$CONFIG_DIR/blocklist"
+else
+  BLOCKLIST="$REPO_DIR/blocklist"
+fi
 
 HOSTS="/etc/hosts"
 MARK_START='# >>> focus blocklist >>>'
@@ -57,9 +80,9 @@ Usage: focus <command> [args]
   rm  <url...>     remove domain(s) from the blocklist (re-applies if enabled)
   list             print the blocklist (one domain per line)
   status           show whether focus is enabled, plus the domain count
-  install          PATH symlink, tab-completion, and a scoped NOPASSWD rule so
-                   on/off stop prompting for a password
-  remove           uninstall focus: undo install and clear any active block
+  install          set up passwordless on/off (a scoped NOPASSWD rule); from a
+                   source checkout, also a PATH symlink + tab-completion
+  remove           undo install and clear any active /etc/hosts block
   help             print this message
 
 URLs passed to add/rm may be full ("https://www.site.com/x") — they are
@@ -114,13 +137,20 @@ count_domains() { clean_list | grep -c . }
 is_enabled() { grep -qF "$MARK_START" "$HOSTS" 2>/dev/null }
 
 # First-run convenience: if there's no personal blocklist yet, seed one from the
-# shipped example so a fresh clone works immediately. The real blocklist is
-# gitignored, so it stays local.
+# shipped example so a fresh clone (or brew install) works immediately. The
+# example sits beside the script in a checkout, and under share/focus when
+# installed; try both. The real blocklist stays local (gitignored in a clone,
+# under ~/.config when managed).
 ensure_blocklist() {
   [[ -f "$BLOCKLIST" ]] && return 0
-  [[ -f "$REPO_DIR/blocklist.example" ]] || return 0
-  cp "$REPO_DIR/blocklist.example" "$BLOCKLIST"
-  echo "created $BLOCKLIST from blocklist.example — edit with 'focus add'/'focus rm'." >&2
+  local ex
+  for ex in "$REPO_DIR/blocklist.example" "$REPO_DIR/share/focus/blocklist.example"; do
+    [[ -f "$ex" ]] || continue
+    mkdir -p "${BLOCKLIST:h}"
+    cp "$ex" "$BLOCKLIST"
+    echo "created $BLOCKLIST from ${ex:t} — edit with 'focus add'/'focus rm'." >&2
+    return 0
+  done
 }
 
 # Normalize a possibly-full URL into a bare apex-ish domain.
@@ -240,13 +270,20 @@ cmd_status() {
 }
 
 cmd_install() {
-  local link="/usr/local/bin/focus"
-  local compdir="/usr/local/share/zsh/site-functions"
-  echo "linking $link -> $SELF (sudo)"
-  sudo ln -sf "$SELF" "$link"
-  sudo mkdir -p "$compdir"
-  sudo ln -sf "$REPO_DIR/completions/_focus" "$compdir/_focus"
-  echo "installed completion -> $compdir/_focus"
+  if (( MANAGED )); then
+    # Homebrew already put focus on your PATH and installed completion; the one
+    # thing it can't do is the passwordless-sudo setup below, so that's all
+    # install does here.
+    echo "focus is managed by your package manager — PATH and completion are already set up."
+  else
+    local link="/usr/local/bin/focus"
+    local compdir="/usr/local/share/zsh/site-functions"
+    echo "linking $link -> $SELF (sudo)"
+    sudo ln -sf "$SELF" "$link"
+    sudo mkdir -p "$compdir"
+    sudo ln -sf "$REPO_DIR/completions/_focus" "$compdir/_focus"
+    echo "installed completion -> $compdir/_focus"
+  fi
 
   # Render a root-owned copy of the helper with this blocklist path baked in
   # LITERALLY (no FOCUS_BLOCKLIST env fallback in the privileged copy), then add
@@ -273,20 +310,18 @@ cmd_install() {
   fi
   rm -f "$rule"
 
-  echo "run 'exec zsh' (or open a new shell) to enable tab-completion."
+  (( MANAGED )) || echo "run 'exec zsh' (or open a new shell) to enable tab-completion."
 }
 
 cmd_remove() {
-  local link="/usr/local/bin/focus"
-  local comp="/usr/local/share/zsh/site-functions/_focus"
-
   # Clear any active block first, so it isn't orphaned once focus is gone.
   if is_enabled; then
     echo "clearing active /etc/hosts block…"
     apply_block off >/dev/null
   fi
 
-  # Drop the NOPASSWD rule and the root-owned helper it points at.
+  # Drop the NOPASSWD rule and the root-owned helper it points at. This is the
+  # part a package manager can't undo, so it runs in both modes.
   if [[ -f "$SUDOERS_RULE" ]]; then
     echo "removing $SUDOERS_RULE (sudo)"
     sudo rm -f "$SUDOERS_RULE"
@@ -295,6 +330,17 @@ cmd_remove() {
     echo "removing $NOPASSWD_HELPER (sudo)"
     sudo rm -f "$NOPASSWD_HELPER"
   fi
+
+  if (( MANAGED )); then
+    # Homebrew owns the PATH entry and completion — don't touch them (on Intel
+    # the PATH symlink IS brew's own link). Just tell the user the next step.
+    echo "cleared the passwordless-sudo setup and any active block."
+    echo "run 'brew uninstall focus' to remove the program itself."
+    return 0
+  fi
+
+  local link="/usr/local/bin/focus"
+  local comp="/usr/local/share/zsh/site-functions/_focus"
 
   # Only remove symlinks that actually point at this repo — never clobber an
   # unrelated file someone happens to have at those paths.

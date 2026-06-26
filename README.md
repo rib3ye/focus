@@ -44,8 +44,8 @@ focus add <url...>   add domain(s) to the blocklist (full URLs are normalized)
 focus rm  <url...>   remove domain(s) from the blocklist
 focus list           print the blocklist
 focus status         show enabled/disabled + domain count
-focus install        symlink focus onto your PATH + install zsh tab-completion
-focus remove         uninstall: remove the symlinks and clear any active block
+focus install        passwordless on/off; from a checkout also PATH symlink + completion
+focus remove         undo install and clear any active block
 focus help           print usage
 ```
 
@@ -54,39 +54,47 @@ automatically. URLs are normalized to a bare domain:
 `https://www.YouTube.com/feed` → `youtube.com`. Each domain blocks both the apex
 and its `www.` host.
 
-## Setup
+## Install
+
+### Homebrew
 
 ```
-git clone <this repo> focus
+brew install rib3ye/tap/focus
+```
+
+This puts `focus` on your PATH and installs zsh tab-completion. Your blocklist
+lives at `~/.config/focus/blocklist`, seeded from a bundled example the first
+time you run a command and left untouched by upgrades. Reload your shell
+(`exec zsh`) to pick up completion, then `focus <Tab>` completes commands and
+`focus rm <Tab>` completes blocked domains.
+
+Optionally make `on`/`off` stop prompting for your password:
+
+```
+focus install           # adds a scoped passwordless-sudo rule (see Privileges)
+```
+
+Under Homebrew, `install` only sets up that rule — brew already owns the PATH
+entry and completion. To undo it and clear any active block before
+`brew uninstall focus`, run `focus remove`.
+
+### From source
+
+```
+git clone https://github.com/rib3ye/focus
 cd focus
 ./bin/focus add reddit.com youtube.com   # build your list
 ./bin/focus on                           # start focusing
+./bin/focus install                      # optional: PATH symlink, completion, passwordless on/off
+exec zsh                                  # reload to pick up tab-completion
 ```
 
-Your blocklist lives in a local `blocklist` file. It is **gitignored and never
-published** — `blocklist.example` is the shipped starting point, and the script
-copies it to `blocklist` automatically the first time you run a command. Edit
-your list with `focus add` / `focus rm`, or by hand.
-
-### Put `focus` on your PATH
-
-```
-./bin/focus install     # PATH symlink + completion + passwordless on/off
-exec zsh                # reload the shell to pick up tab-completion
-```
-
-Then run `focus` from anywhere; `focus <Tab>` completes commands and
-`focus rm <Tab>` completes domains from your blocklist. The symlink points back
-at this repo, so don't move or delete the folder after installing.
-
-To undo it:
-
-```
-focus remove            # removes the symlinks and clears any active hosts block
-```
-
-This only removes symlinks that point at this repo, and leaves the repo and your
-blocklist in place.
+From a checkout your blocklist stays in-tree at `./blocklist` — **gitignored and
+never published**; `blocklist.example` is the shipped starting point, copied to
+`blocklist` on first run. Edit it with `focus add` / `focus rm`, or by hand. The
+PATH symlink points back at this repo, so don't move or delete the folder after
+`install`. Undo with `focus remove` — it removes only symlinks that point at
+this repo and leaves the repo and your blocklist in place.
 
 ## Service workers (the YouTube problem)
 

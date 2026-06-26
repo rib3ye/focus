@@ -29,10 +29,19 @@ _focus() {
     args)
       case "${line[1]}" in
         rm)
-          # complete domains from the blocklist next to the real focus script
+          # Resolve the blocklist the same way the focus script does: an
+          # installed/managed copy (under a Homebrew Cellar or other read-only
+          # prefix) keeps its list in ~/.config/focus; a checkout keeps it
+          # beside the script. FOCUS_BLOCKLIST overrides both.
           local self bl
           self="${commands[focus]:A}"
-          bl="${self:h:h}/blocklist"
+          if [[ -n "$FOCUS_BLOCKLIST" ]]; then
+            bl="$FOCUS_BLOCKLIST"
+          elif [[ "$self" == */Cellar/* || ! -w "${self:h:h}" ]]; then
+            bl="${XDG_CONFIG_HOME:-$HOME/.config}/focus/blocklist"
+          else
+            bl="${self:h:h}/blocklist"
+          fi
           if [[ -f "$bl" ]]; then
             local -a domains
             domains=( ${(f)"$(grep -vE '^[[:space:]]*(#|$)' "$bl")"} )
