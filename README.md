@@ -85,16 +85,23 @@ git clone https://github.com/rib3ye/focus
 cd focus
 ./bin/focus add reddit.com youtube.com   # build your list
 ./bin/focus on                           # start focusing
-./bin/focus install                      # optional: PATH symlink, completion, passwordless on/off
+./bin/focus install                      # optional: ~/.local symlink, completion, passwordless on/off
 exec zsh                                  # reload to pick up tab-completion
 ```
 
 From a checkout your blocklist stays in-tree at `./blocklist` — **gitignored and
 never published**; `blocklist.example` is the shipped starting point, copied to
-`blocklist` on first run. Edit it with `focus add` / `focus rm`, or by hand. The
-PATH symlink points back at this repo, so don't move or delete the folder after
-`install`. Undo with `focus remove` — it removes only symlinks that point at
-this repo and leaves the repo and your blocklist in place.
+`blocklist` on first run. Edit it with `focus add` / `focus rm`, or by hand.
+
+`install` is per-user and needs no `sudo` for the PATH/completion part: it
+symlinks `focus` into `~/.local/bin` and the completion into
+`~/.local/share/zsh/site-functions`, printing a one-line `PATH`/`fpath` hint for
+your `~/.zshrc` if either isn't picked up yet. (The passwordless `on`/`off`
+setup still uses `sudo` — that genuinely needs root.) The symlink points back at
+this repo, so don't move or delete the folder after `install`. Undo with
+`focus remove` — it removes only symlinks that point at this repo (including any
+from older `/usr/local` installs) and leaves the repo and your blocklist in
+place.
 
 ## Service workers (the YouTube problem)
 

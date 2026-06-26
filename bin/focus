@@ -92,6 +92,19 @@ password until you run 'focus install', which sets up passwordless on/off.
 EOF
 }
 
+# Remove symlink $1, but only if it actually resolves to $2 (ours) — never
+# clobber an unrelated file at that path. $3 non-empty → use sudo (for the
+# legacy root-owned links under /usr/local). Stays quiet when nothing's there.
+unlink_if_ours() {
+  local link="$1" want="$2" use_sudo="$3"
+  if [[ -L "$link" && "${link:A}" == "${want:A}" ]]; then
+    echo "removing $link"
+    if [[ -n "$use_sudo" ]]; then sudo rm -f "$link"; else rm -f "$link"; fi
+  elif [[ -e "$link" ]]; then
+    echo "skipping $link — not a symlink to this focus"
+  fi
+}
+
 # Guard for the NOPASSWD helper's directory: it must be root-owned and not
 # writable by group/other, or a non-root user could swap the helper and run
 # arbitrary code as root. Creates it safely if absent; refuses if unsafe.
@@ -276,13 +289,27 @@ cmd_install() {
     # install does here.
     echo "focus is managed by your package manager — PATH and completion are already set up."
   else
-    local link="/usr/local/bin/focus"
-    local compdir="/usr/local/share/zsh/site-functions"
-    echo "linking $link -> $SELF (sudo)"
-    sudo ln -sf "$SELF" "$link"
-    sudo mkdir -p "$compdir"
-    sudo ln -sf "$REPO_DIR/completions/_focus" "$compdir/_focus"
+    # Per-user, no sudo: ~/.local/bin for the binary and the XDG data dir for
+    # completion. (Only the privileged on/off helper below needs root.)
+    local bindir="$HOME/.local/bin"
+    local compdir="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+    mkdir -p "$bindir" "$compdir"
+    ln -sf "$SELF" "$bindir/focus"
+    echo "linked $bindir/focus -> $SELF"
+    ln -sf "$REPO_DIR/completions/_focus" "$compdir/_focus"
     echo "installed completion -> $compdir/_focus"
+
+    # ~/.local/bin isn't on every macOS PATH; nudge only if it's actually absent.
+    case ":$PATH:" in
+      *":$bindir:"*) ;;
+      *) echo "note: add ~/.local/bin to your PATH (e.g. in ~/.zshrc):" >&2
+         echo '      export PATH="$HOME/.local/bin:$PATH"' >&2 ;;
+    esac
+    # The XDG completion dir usually isn't on zsh's fpath; nudge to add it.
+    if [[ " ${fpath[*]} " != *" $compdir "* ]]; then
+      echo "note: enable tab-completion by adding to ~/.zshrc (before compinit):" >&2
+      echo "      fpath=($compdir \$fpath)" >&2
+    fi
   fi
 
   # Render a root-owned copy of the helper with this blocklist path baked in
@@ -339,28 +366,15 @@ cmd_remove() {
     return 0
   fi
 
-  local link="/usr/local/bin/focus"
-  local comp="/usr/local/share/zsh/site-functions/_focus"
+  local compdir="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+  local repocomp="$REPO_DIR/completions/_focus"
 
-  # Only remove symlinks that actually point at this repo — never clobber an
-  # unrelated file someone happens to have at those paths.
-  if [[ -L "$link" && "${link:A}" == "${SELF:A}" ]]; then
-    echo "removing $link (sudo)"
-    sudo rm -f "$link"
-  elif [[ -e "$link" ]]; then
-    echo "skipping $link — not a symlink to this script"
-  else
-    echo "nothing at $link"
-  fi
-
-  if [[ -L "$comp" && "${comp:A}" == "${REPO_DIR:A}/completions/_focus" ]]; then
-    echo "removing $comp (sudo)"
-    sudo rm -f "$comp"
-  elif [[ -e "$comp" ]]; then
-    echo "skipping $comp — not ours"
-  else
-    echo "nothing at $comp"
-  fi
+  # Current per-user install (~/.local) — no sudo.
+  unlink_if_ours "$HOME/.local/bin/focus" "$SELF"     ""
+  unlink_if_ours "$compdir/_focus"        "$repocomp" ""
+  # Legacy root-owned install (/usr/local) from older versions — sudo.
+  unlink_if_ours "/usr/local/bin/focus"                       "$SELF"     sudo
+  unlink_if_ours "/usr/local/share/zsh/site-functions/_focus" "$repocomp" sudo
 
   echo "uninstalled. the repo and your blocklist are untouched — delete the folder to fully remove."
 }
